@@ -74,9 +74,8 @@ type LDAPConnection struct {
 	chanResults        map[uint64]chan *ber.Packet
 	lockChanResults    sync.RWMutex
 	chanProcessMessage chan *messagePacket
-	closeLock          sync.RWMutex
+	disconnecting      chan struct{}
 	chanMessageID      chan uint64
-	connected          bool
 }
 
 // Connect connects using information in LDAPConnection.
@@ -85,6 +84,7 @@ func (l *LDAPConnection) Connect() error {
 	l.chanResults = map[uint64]chan *ber.Packet{}
 	l.chanProcessMessage = make(chan *messagePacket)
 	l.chanMessageID = make(chan uint64)
+	l.disconnecting = make(chan struct{})
 
 	if l.conn == nil {
 		var c net.Conn
@@ -121,7 +121,6 @@ func (l *LDAPConnection) Connect() error {
 		}
 	}
 	l.start()
-	l.connected = true
 	if l.IsTLS {
 		err := l.startTLS()
 		if err != nil {
@@ -273,12 +272,11 @@ func (l *LDAPConnection) processMessages() {
 	defer l.closeAllChannels()
 	defer func() {
 		// Close all channels, connection and quit.
-		// Use closeLock to stop MessageRequests
-		// and l.connected to stop any future MessageRequests.
-		l.closeLock.Lock()
-		defer l.closeLock.Unlock()
-		l.connected = false
-		// will shutdown reader.
+		// Use disconnecting chan to stop all MessageRequests.
+
+		// will shutdown readers.
+		close(l.disconnecting)
+
 		l.conn.Close()
 	}()
 	var message_id uint64 = 1
@@ -402,11 +400,13 @@ func (l *LDAPConnection) readerToChanResults(message_packet *messagePacket) {
 func (l *LDAPConnection) sendProcessMessage(message *messagePacket) {
 	go func() {
 		// multiple senders can queue on l.chanProcessMessage
-		// but block on shutdown.
-		l.closeLock.RLock()
-		defer l.closeLock.RUnlock()
-		if l.connected {
-			l.chanProcessMessage <- message
+		// but exit cleanly on shutdown.
+
+		select {
+		case <-l.disconnecting:
+			// Quit in progress.  Abort send (no reader anyway).
+		case l.chanProcessMessage <- message:
+			// Message sent.  Exit normally.
 		}
 	}()
 }
